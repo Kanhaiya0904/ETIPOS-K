@@ -2,6 +2,7 @@ import io
 import math
 import json
 import re
+import lief
 import yara
 from typing import Dict, Any, Optional, Tuple
 import clamd
@@ -130,6 +131,121 @@ def scan_yara(data: bytes) -> list[dict]:
         print(f"YARA scan error: {e}")
         return []
 
+def analyze_executable_lief(data: bytes) -> dict:
+    """
+    Analyze executable files using LIEF.
+    Extracts basic structural information without assigning a malware verdict.
+    """
+    try:
+        binary = lief.parse(list(data))
+
+        if binary is None:
+            return {
+                "available": False,
+                "reason": "LIEF could not parse the file"
+            }
+
+        result = {
+            "available": True,
+            "format": str(binary.format),
+            "entrypoint": getattr(binary, "entrypoint", None),
+            "sections": [],
+            "imports": [],
+        }
+
+        for section in binary.sections:
+            result["sections"].append({
+                "name": section.name,
+                "size": section.size,
+                "virtual_size": section.virtual_size,
+            })
+
+        if hasattr(binary, "imports"):
+            result["imports"] = []
+
+            for library in binary.imports:
+                result["imports"].append({
+                    "name": library.name,
+                    "functions": [
+                        entry.name
+                        for entry in library.entries
+                        if entry.name
+                    ]
+                })
+
+        return result
+
+    except Exception as e:
+        return {
+            "available": False,
+            "reason": f"LIEF analysis failed: {str(e)}"
+        }
+
+def extract_interesting_imports(lief_analysis: dict) -> list[dict]:
+    """
+    Classify potentially interesting imported Windows APIs.
+    These are supporting static-analysis indicators, not malware verdicts.
+    """
+    if not lief_analysis or not lief_analysis.get("available"):
+        return []
+
+    import_categories = {
+        "Process Injection": {
+            "VirtualAlloc",
+            "VirtualAllocEx",
+            "VirtualProtect",
+            "VirtualProtectEx",
+            "WriteProcessMemory",
+            "CreateRemoteThread",
+            "NtCreateThreadEx",
+            "QueueUserAPC",
+        },
+        "Process Creation": {
+            "CreateProcessA",
+            "CreateProcessW",
+            "WinExec",
+            "ShellExecuteA",
+            "ShellExecuteW",
+        },
+        "Memory Manipulation": {
+            "HeapAlloc",
+            "HeapCreate",
+            "VirtualFree",
+            "VirtualFreeEx",
+            "MapViewOfFile",
+            "UnmapViewOfFile",
+        },
+        "Networking": {
+            "InternetOpenA",
+            "InternetOpenW",
+            "InternetConnectA",
+            "InternetConnectW",
+            "HttpOpenRequestA",
+            "HttpOpenRequestW",
+            "WinHttpOpen",
+            "WinHttpConnect",
+            "WSAStartup",
+            "connect",
+        },
+    }
+
+    results = []
+
+    for library in lief_analysis.get("imports", []):
+        library_name = library.get("name", "")
+        functions = library.get("functions", [])
+
+        for function_name in functions:
+            for category, apis in import_categories.items():
+                if function_name in apis:
+                    results.append({
+                        "library": library_name,
+                        "function": function_name,
+                        "category": category,
+                    })
+
+    return results
+
 def detect_file_type(data: bytes, filename: str) -> Dict[str, Any]:
     """
     Uses Google Magika to detect actual file type from binary contents
@@ -146,16 +262,17 @@ def detect_file_type(data: bytes, filename: str) -> Dict[str, Any]:
 
     # Known executable/script labels flagged by Magika
     executable_labels = {
-        "exe", "elf", "mach-o", "dll", "pe", "batch", "powershell", 
-        "sh", "vbs", "javascript", "python", "autorun"
+        "exe", "elf", "mach-o", "dll", "pe", "batch", "powershell",
+        "sh", "vbs", "javascript", "python", "autorun", "pebin"
     }
 
     is_dangerous_executable = actual_label in executable_labels
     spoofed = False
 
-    # Check if a non-executable extension claims an executable payload
+    # Only treat a text-like extension as spoofed when Magika is confidently identifying
+    # an executable/script payload rather than a low-confidence guess from ordinary text.
     innocent_extensions = {"pdf", "jpg", "jpeg", "png", "gif", "txt", "docx", "xlsx", "mp4", "mp3"}
-    if claimed_ext in innocent_extensions and is_dangerous_executable:
+    if claimed_ext in innocent_extensions and is_dangerous_executable and confidence >= 80.0:
         spoofed = True
 
     return {
@@ -237,52 +354,105 @@ def llm_worst_case_analysis(data: bytes, filename: str, context: Dict[str, Any])
     Only triggered when a file is suspicious, obfuscated, or ambiguous.
     Passes extracted printable strings and metadata (NOT dangerous raw execution).
     """
-    # Extract printable ASCII/UTF-8 snippets safely
     sample = data[:4096]
     printable_chars = [chr(b) if 32 <= b <= 126 or b in (10, 13, 9) else " " for b in sample]
     extracted_text = "".join(printable_chars).strip()
-    # Compact multiple spaces
     extracted_text = re.sub(r"\s+", " ", extracted_text)[:1500]
 
-    system_prompt = f"""You are a specialized malware and security triage analyst.
-Your job is to analyze suspicious or anomalous files that passed standard filters but exhibit abnormal characteristics.
+    system_prompt = f"""You are a local malware triage model. Use the supplied static-analysis evidence as the authoritative context. Do not invent malicious behavior. Never mention an indicator that is not present in the evidence. API names alone do not prove malware. Common PowerShell references alone do not prove malware. Do not infer PowerShell unless PowerShell is explicitly present in the indicators, YARA matches, or supplied snippet.
 
-File Details:
+If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. If the evidence is weak or generic text, use SAFE with cautious wording. Do not invent reverse shells, download behavior, encoded commands, script-host execution, or other traits unless they are clearly present in the supplied evidence. The reason must be directly supported by the static-analysis evidence.
+
+File details:
 - Filename: {filename}
-- Claimed Type: {context.get('claimed_extension')}
-- Detected Type: {context.get('actual_type')} ({context.get('mime_type')})
-- Shannon Entropy: {context.get('entropy')} (Normal text/code is 3.5-5.5, high is >7.0)
-- Detected Indicators: {context.get('indicators')}
+- Claimed type: {context.get('claimed_extension')}
+- Detected type: {context.get('actual_type')} ({context.get('mime_type')})
+- Entropy: {context.get('entropy')}
+- Indicators: {context.get('indicators')}
+- YARA matches: {context.get('yara_matches')}
 
-Extracted Printable Byte Snippet (First 1.5KB sanitized):
+Printable snippet:
 \"\"\"{extracted_text}\"\"\"
 
-Evaluate if this file exhibits indicators of malicious intent (such as obfuscation, reverse shells, dropper behavior, malicious macros, or exploit staging).
-
-Respond ONLY with a valid JSON object in this exact schema (no markdown, no backticks, no explanations outside JSON):
-{{
-  "verdict": "SAFE" or "SUSPICIOUS" or "MALICIOUS",
-  "threat_score": <number from 0 to 100>,
-  "confidence": <number from 0 to 100>,
-  "reason": "<one or two sentences explaining your security assessment>",
-  "flagged_traits": ["<trait 1>", "<trait 2>"]
-}}
+Return ONLY compact JSON with this exact schema:
+{{"verdict":"SAFE","threat_score":0,"confidence":0,"reason":"short assessment","flagged_traits":[]}}
+Allowed verdict values: SAFE, SUSPICIOUS, MALICIOUS.
+Keep reason to one sentence, no markdown, no backticks, no extra text, and no backslashes unless escaped correctly.
 """
+
     try:
-        raw_response = llm.invoke(system_prompt).strip()
-        # Clean potential markdown wrapping
-        cleaned = re.sub(r"^```json\s*", "", raw_response)
-        cleaned = re.sub(r"^```\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-        result = json.loads(cleaned)
-        return result
-    except Exception as e:
+        raw_response = llm.invoke(system_prompt)
+
+        if isinstance(raw_response, dict):
+            candidate = raw_response.get("content") or raw_response.get("text") or json.dumps(raw_response)
+        else:
+            candidate = str(raw_response)
+
+        candidate = (candidate or "").strip()
+        if not candidate:
+            raise ValueError("Empty model response")
+
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```\s*$", "", candidate, flags=re.IGNORECASE)
+        candidate = candidate.strip()
+
+        match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+        if match:
+            candidate = match.group(0)
+
+        try:
+            result = json.loads(candidate)
+        except json.JSONDecodeError:
+            cleaned = candidate.replace("\t", " ")
+            try:
+                result = json.loads(cleaned)
+            except json.JSONDecodeError:
+                raise ValueError("Malformed JSON returned by AI")
+
+        if not isinstance(result, dict):
+            raise ValueError("AI returned a non-object JSON value")
+
+        verdict = str(result.get("verdict", "")).upper()
+        if verdict not in {"SAFE", "SUSPICIOUS", "MALICIOUS", "ANALYSIS_ERROR"}:
+            raise ValueError("Invalid verdict returned by AI")
+
+        try:
+            threat_score = int(float(result.get("threat_score", 0)))
+        except (TypeError, ValueError):
+            threat_score = 0
+        threat_score = max(0, min(100, threat_score))
+
+        try:
+            confidence = int(float(result.get("confidence", 0)))
+        except (TypeError, ValueError):
+            confidence = 0
+        confidence = max(0, min(100, confidence))
+
+        reason = result.get("reason", "")
+        if not isinstance(reason, str):
+            reason = "Security assessment based on static-analysis evidence."
+        reason = reason.strip()[:300] or "Security assessment based on static-analysis evidence."
+
+        flagged_traits = result.get("flagged_traits", [])
+        if not isinstance(flagged_traits, list):
+            flagged_traits = []
+        flagged_traits = [str(item) for item in flagged_traits[:10] if str(item).strip()]
+
+        return {
+            "verdict": verdict,
+            "threat_score": threat_score,
+            "confidence": confidence,
+            "reason": reason,
+            "flagged_traits": flagged_traits,
+        }
+
+    except Exception:
         return {
             "verdict": "ANALYSIS_ERROR",
             "threat_score": 0,
             "confidence": 0,
-            "reason": f"AI triage could not be completed: {str(e)}",
-            "flagged_traits": ["LLM evaluation unavailable"]
+            "reason": "AI returned an invalid response; static-analysis results remain available.",
+            "flagged_traits": ["LLM returned invalid JSON"],
         }
 
 def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
@@ -321,14 +491,23 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     entropy = calculate_entropy(data)
     indicators = extract_suspicious_indicators(data)
     yara_matches = scan_yara(data)
+    lief_analysis = None
+    interesting_imports = []
+
+
+    if type_info["is_executable"]:
+        lief_analysis = analyze_executable_lief(data)
+        interesting_imports = extract_interesting_imports(lief_analysis)
     
     context = {
+        "interesting_imports": interesting_imports,
         "claimed_extension": type_info["claimed_extension"],
         "actual_type": type_info["actual_type"],
         "mime_type": type_info["mime_type"],
         "entropy": entropy,
         "indicators": indicators,
-        "yara_matches": yara_matches
+        "yara_matches": yara_matches,
+        "lief_analysis": lief_analysis
     }
 
     # Criteria to invoke Tier 3 AI Specialist:
@@ -337,8 +516,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     # - High entropy is retained as supporting evidence, not an automatic trigger
     needs_ai_triage = (
         len(indicators) > 0 or
-        len(yara_matches) > 0 or
-        type_info["is_executable"]
+        len(yara_matches) > 0
     )
 
     llm_result = None
@@ -347,17 +525,36 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
 
     if needs_ai_triage:
         llm_result = llm_worst_case_analysis(data, filename, context)
-        if llm_result.get("verdict") == "MALICIOUS" or llm_result.get("threat_score", 0) >= 70:
-            final_verdict = "MALICIOUS"
-            status = "REJECTED"
-        elif llm_result.get("verdict") == "SUSPICIOUS" or llm_result.get("threat_score", 0) >= 40:
-            final_verdict = "SUSPICIOUS"
-            status = "QUARANTINE"
-        elif llm_result.get("verdict") == "ANALYSIS_ERROR":
-            final_verdict = "ANALYSIS_ERROR"
-            status = "ANALYSIS_ERROR"
+
+    if needs_ai_triage and not llm_result:
+        final_verdict = "ANALYSIS_ERROR"
+        status = "ANALYSIS_ERROR"
+
+    elif llm_result is None:
+        final_verdict = "SAFE"
+        status = "APPROVED"
+
+    elif llm_result.get("verdict") == "SAFE":
+        final_verdict = "SAFE"
+        status = "APPROVED"
+
+    elif llm_result.get("verdict") == "MALICIOUS":
+        final_verdict = "MALICIOUS"
+        status = "REJECTED"
+
+    elif llm_result.get("verdict") == "SUSPICIOUS":
+        final_verdict = "SUSPICIOUS"
+        status = "QUARANTINE"
+
+    elif llm_result.get("verdict") == "ANALYSIS_ERROR":
+        final_verdict = "ANALYSIS_ERROR"
+        status = "ANALYSIS_ERROR"
+    else:
+        final_verdict = "ANALYSIS_ERROR"
+        status = "ANALYSIS_ERROR"
 
     return {
+        "interesting_imports": interesting_imports,
         "status": status,
         "verdict": final_verdict,
         "stage": "TIER_3_AI_TRIAGE" if needs_ai_triage else "TIER_2_PASSED",
@@ -365,6 +562,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "entropy": entropy,
         "indicators": indicators,
         "yara_matches": yara_matches,
+        "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
     }
