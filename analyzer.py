@@ -229,11 +229,11 @@ Respond ONLY with a valid JSON object in this exact schema (no markdown, no back
         return result
     except Exception as e:
         return {
-            "verdict": "SUSPICIOUS",
-            "threat_score": 50,
-            "confidence": 40,
-            "reason": f"AI triage parser encountered an issue: {str(e)}. Proceeding with caution.",
-            "flagged_traits": ["LLM evaluation parse error"]
+            "verdict": "ANALYSIS_ERROR",
+            "threat_score": 0,
+            "confidence": 0,
+            "reason": f"AI triage could not be completed: {str(e)}",
+            "flagged_traits": ["LLM evaluation unavailable"]
         }
 
 def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
@@ -302,6 +302,9 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         elif llm_result.get("verdict") == "SUSPICIOUS" or llm_result.get("threat_score", 0) >= 40:
             final_verdict = "SUSPICIOUS"
             status = "QUARANTINE"
+        elif llm_result.get("verdict") == "ANALYSIS_ERROR":
+            final_verdict = "ANALYSIS_ERROR"
+            status = "ANALYSIS_ERROR"
 
     return {
         "status": status,
