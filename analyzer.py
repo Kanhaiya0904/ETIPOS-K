@@ -153,32 +153,45 @@ def scan_clamav(data: bytes) -> Tuple[bool, Optional[str]]:
 
 def extract_suspicious_indicators(data: bytes) -> list[str]:
     """
-    Extracts suspicious heuristic markers such as shellcode APIs,
-    PowerShell encoded commands, dangerous system calls, or eval loops.
+    Extracts heuristic security indicators from raw file bytes.
+
+    Indicators are classified by strength. Common words such as
+    'powershell' are treated as weak signals, while combinations
+    associated with code injection or payload execution are stronger.
     """
     indicators = []
-    # Sample up to first 1MB for heuristic string checks
-    sample = data[:1024 * 1024]
-    
-    patterns = [
-        (b"powershell", "PowerShell invocation detected"),
-        (b"-enc", "Possible base64 encoded command flag"),
-        (b"WScript.Shell", "Windows Script Host invocation"),
-        (b"FromBase64String", "Base64 payload de-obfuscation marker"),
-        (b"VirtualAlloc", "Memory allocation API often used for shellcode injection"),
-        (b"CreateRemoteThread", "Thread injection API detected"),
-        (b"cmd.exe", "Command prompt invocation"),
-        (b"eval(", "Dynamic code execution (eval) detected"),
-        (b"exec(", "Dynamic execution (exec) detected"),
-        (b"/bin/sh", "Unix shell execution detected"),
-        (b"/bin/bash", "Unix bash execution detected"),
-        (b"curl ", "Embedded HTTP downloader detected"),
-        (b"wget ", "Embedded HTTP downloader detected"),
+
+    sample = data[:1024 * 1024].lower()
+
+    weak_patterns = [
+        (b"powershell", "PowerShell reference detected"),
+        (b"cmd.exe", "Command prompt reference detected"),
+        (b"/bin/sh", "Unix shell reference detected"),
+        (b"/bin/bash", "Bash shell reference detected"),
+        (b"curl ", "Curl command reference detected"),
+        (b"wget ", "Wget command reference detected"),
     ]
 
-    for pat, desc in patterns:
-        if pat.lower() in sample.lower():
-            indicators.append(desc)
+    strong_patterns = [
+        (b"wscript.shell", "Windows Script Host invocation detected"),
+        (b"frombase64string", "Base64 payload de-obfuscation marker detected"),
+        (b"virtualalloc", "Memory allocation API associated with code injection detected"),
+        (b"createremotethread", "Remote thread creation API detected"),
+    ]
+
+    for pattern, description in weak_patterns:
+        if pattern in sample:
+            indicators.append(f"WEAK: {description}")
+
+    for pattern, description in strong_patterns:
+        if pattern in sample:
+            indicators.append(f"STRONG: {description}")
+
+    if b"-enc" in sample and b"powershell" in sample:
+        indicators.append("STRONG: PowerShell encoded-command combination detected")
+
+    if b"eval(" in sample or b"exec(" in sample:
+        indicators.append("WEAK: Dynamic code execution reference detected")
 
     return indicators
 
