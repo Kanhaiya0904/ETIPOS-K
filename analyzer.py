@@ -281,12 +281,11 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     }
 
     # Criteria to invoke Tier 3 AI Specialist:
-    # - Suspicious heuristics found (e.g. powershell, eval, memory allocation APIs)
-    # - High entropy (> 7.2) on script/text/document files (suggests obfuscation/packer)
-    # - Executable file format transferred unexpectedly
+    # - Suspicious heuristics found
+    # - Executable file format detected
+    # - High entropy is retained as supporting evidence, not an automatic trigger
     needs_ai_triage = (
-        len(indicators) > 0 or 
-        (entropy > 7.2 and type_info["actual_type"] not in {"zip", "gz", "tar", "mp4", "mp3", "jpg", "png"}) or
+        len(indicators) > 0 or
         type_info["is_executable"]
     )
 
