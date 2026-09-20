@@ -2,6 +2,7 @@ import io
 import math
 import json
 import re
+import yara
 from typing import Dict, Any, Optional, Tuple
 import clamd
 from magika import Magika
@@ -93,6 +94,41 @@ def calculate_entropy(data: bytes) -> float:
             p = count / length
             entropy -= p * math.log2(p)
     return round(entropy, 3)
+
+def scan_yara(data: bytes) -> list[dict]:
+    """
+    Scan file contents using YARA rules.
+    Returns structured information about matched rules.
+    """
+    try:
+        rules_path = "yara_rules"
+
+        rules = yara.compile(
+            filepaths={
+                "suspicious_rules": f"{rules_path}/suspicious_scripts.yar"
+            }
+        )
+
+        matches = rules.match(data=data)
+
+        results = []
+
+        for match in matches:
+            severity = "medium"
+
+            if match.rule == "Suspicious_Memory_Injection":
+                severity = "high"
+
+            results.append({
+                "rule": match.rule,
+                "severity": severity
+            })
+
+        return results
+
+    except Exception as e:
+        print(f"YARA scan error: {e}")
+        return []
 
 def detect_file_type(data: bytes, filename: str) -> Dict[str, Any]:
     """
@@ -284,13 +320,15 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     # 3. Tier 2: Heuristics & Entropy
     entropy = calculate_entropy(data)
     indicators = extract_suspicious_indicators(data)
+    yara_matches = scan_yara(data)
     
     context = {
         "claimed_extension": type_info["claimed_extension"],
         "actual_type": type_info["actual_type"],
         "mime_type": type_info["mime_type"],
         "entropy": entropy,
-        "indicators": indicators
+        "indicators": indicators,
+        "yara_matches": yara_matches
     }
 
     # Criteria to invoke Tier 3 AI Specialist:
@@ -299,6 +337,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     # - High entropy is retained as supporting evidence, not an automatic trigger
     needs_ai_triage = (
         len(indicators) > 0 or
+        len(yara_matches) > 0 or
         type_info["is_executable"]
     )
 
@@ -325,6 +364,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "file_info": type_info,
         "entropy": entropy,
         "indicators": indicators,
+        "yara_matches": yara_matches,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
     }
