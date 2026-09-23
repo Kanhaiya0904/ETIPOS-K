@@ -2,6 +2,8 @@ import io
 import math
 import json
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 import lief
 import yara
 from PyPDF2 import PdfReader
@@ -326,6 +328,133 @@ def analyze_pdf_static(data: bytes) -> dict:
 
     return result
 
+def analyze_docx_static(data: bytes) -> dict:
+
+    result = {
+        "available": False,
+        "macro": False,
+        "embedded_objects": False,
+        "external_links": False,
+        "dde": False,
+        "ole_objects": False,
+        "urls": [],
+        "indicators": [],
+    }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as z:
+            names = z.namelist()
+            result["available"] = True
+
+            # Macro-enabled Office content
+            macro_files = [
+                name for name in names
+                if name.lower().endswith("vbaproject.bin")
+            ]
+
+            if macro_files:
+                result["macro"] = True
+                result["indicators"].append(
+                    "DOCX VBA macro project detected"
+                )
+
+            # Embedded files / OLE objects
+            embedded_files = [
+                name for name in names
+                if name.startswith("word/embeddings/")
+            ]
+
+            if embedded_files:
+                result["embedded_objects"] = True
+                result["ole_objects"] = True
+                result["indicators"].append(
+                    "DOCX embedded objects detected"
+                )
+
+            # External relationships
+            relationship_files = [
+                name for name in names
+                if name.lower().endswith(".rels")
+            ]
+
+            for rel_file in relationship_files:
+                try:
+                    content = z.read(rel_file).decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+
+                    if 'TargetMode="External"' in content:
+                        result["external_links"] = True
+                        result["indicators"].append(
+                            "DOCX external relationship detected"
+                        )
+
+                    urls = re.findall(
+                        r"https?://[^\s\"'<>]+",
+                        content,
+                        flags=re.IGNORECASE,
+                )
+
+                    for url in urls:
+                        if (
+                            "schemas.openxmlformats.org" not in url.lower()
+                            and "schemas.microsoft.com" not in url.lower()
+                            and url not in result["urls"]
+                        ):
+                            result["urls"].append(url)
+
+                except Exception:
+                    continue
+
+            # DDE detection
+            #
+            # Only inspect actual Word field instruction content.
+            # Do not search for the word "dde" throughout all XML,
+            # because normal Word XML can contain unrelated text
+            # that causes false positives.
+            xml_files = [
+                name for name in names
+                if name.lower().endswith(".xml")
+            ]
+
+            for xml_file in xml_files:
+                try:
+                    content = z.read(xml_file).decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+
+                    lowered = content.lower()
+
+                    if (
+                        "w:instrtext" in lowered
+                        and (
+                            "ddeauto" in lowered
+                            or " dde " in lowered
+                        )
+                    ):
+                        result["dde"] = True
+                        result["indicators"].append(
+                            "DOCX DDE field detected"
+                        )
+                        break
+
+                except Exception:
+                    continue
+
+            # Remove duplicate indicators
+            result["indicators"] = list(
+                dict.fromkeys(result["indicators"])
+            )
+
+            return result
+
+    except Exception as exc:
+        result["reason"] = f"DOCX parsing failed: {exc}"
+        return result
+
+
 def analyze_executable_lief(data: bytes) -> dict:
     """
     Analyze executable files using LIEF.
@@ -556,7 +685,7 @@ def llm_worst_case_analysis(data: bytes, filename: str, context: Dict[str, Any])
 
     system_prompt = f"""You are a local malware triage model. Use the supplied static-analysis evidence as the authoritative context. Do not invent malicious behavior. Never mention an indicator that is not present in the evidence. API names alone do not prove malware. Common PowerShell references alone do not prove malware. Do not infer PowerShell unless PowerShell is explicitly present in the indicators, YARA matches, or supplied snippet.
 
-If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware.
+If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware. For DOCX files, external relationships, ordinary hyperlinks, embedded objects, and VBA macro projects are static-analysis findings that must be considered in context; their presence alone does not automatically prove malicious behavior.
 
 File details:
 - Filename: {filename}
@@ -566,8 +695,19 @@ File details:
 - Indicators: {context.get('indicators')}
 - YARA matches: {context.get('yara_matches')}
 - PDF static analysis: {context.get('pdf_analysis')}
+- DOCX static analysis: {context.get('docx_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
+DOCX interpretation guidance:
+- The "indicators" field contains static-analysis findings. These are not automatically malicious.
+- If the DOCX indicators list is non-empty, the reason MUST explicitly acknowledge the detected finding(s).
+- A detected VBA macro project means macro code exists, but does not by itself prove malicious behavior.
+- A detected embedded object means an embedded object exists, but does not by itself prove malicious behavior.
+- A detected external relationship or URL means an external reference exists, but does not by itself prove malicious behavior.
+- Keep static-analysis findings separate from malicious behavior. Do not call a file "free of indicators" when the indicators list is non-empty.
+- If static-analysis indicators are present but there is no direct evidence of malicious behavior, SAFE may still be returned, but the reason MUST state the detected finding and explain that it is not sufficient by itself to establish malicious behavior.
+- Treat "embedded objects", "embedded files", "OLE objects", and "macro projects" as distinct findings.
+- Never invent macro behavior, payloads, commands, network activity, or execution behavior that was not observed.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -575,6 +715,13 @@ Printable snippet:
 Return ONLY compact JSON with this exact schema:
 {{"verdict":"SAFE","threat_score":0,"confidence":0,"reason":"short assessment","flagged_traits":[]}}
 Allowed verdict values: SAFE, SUSPICIOUS, MALICIOUS.
+When multiple DOCX findings are present, prioritize them in this order for the reason: VBA macro project, embedded object/OLE object, DDE, external relationship/URL.
+If a VBA macro project is present, the reason MUST mention the VBA macro project before mentioning any external relationship or URL.
+If an embedded object or OLE object is present and no VBA macro project is present, the reason MUST mention the embedded object/OLE object before any external relationship or URL.
+If DDE is present and no higher-priority finding is present, the reason MUST mention the DDE finding.
+If only an external relationship or URL is present, the reason MUST mention that external relationship or URL.
+If indicators are present but do not establish malicious behavior, explicitly state that the finding was detected but is not sufficient by itself to establish malicious behavior.
+Never describe a non-empty indicators list as having "no indicators".
 Keep reason to one sentence, no markdown, no backticks, no extra text, and no backslashes unless escaped correctly.
 """
 
@@ -700,6 +847,19 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
 
         indicators.extend(pdf_analysis.get("indicators", []))
 
+    docx_analysis = None
+
+    if (
+        type_info["actual_type"].lower() == "docx"
+        or type_info["mime_type"].lower()
+        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ):
+        docx_analysis = analyze_docx_static(data)
+
+        indicators.extend(
+            docx_analysis.get("indicators", [])
+        )
+
     lief_analysis = None
     interesting_imports = []
 
@@ -717,6 +877,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "indicators": indicators,
         "yara_matches": yara_matches,
         "pdf_analysis": pdf_analysis,
+        "docx_analysis": docx_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -745,16 +906,48 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         status = "APPROVED"
 
     elif llm_result.get("verdict") == "SAFE":
-        final_verdict = "SAFE"
-        status = "APPROVED"
+        docx_macro_detected = (
+            type_info["actual_type"].lower() == "docx"
+            and docx_analysis
+            and docx_analysis.get("macro") is True
+        )
+
+        if docx_macro_detected:
+            final_verdict = "SUSPICIOUS"
+            status = "QUARANTINE"
+        else:
+            final_verdict = "SAFE"
+            status = "APPROVED"
 
     elif llm_result.get("verdict") == "MALICIOUS":
         final_verdict = "MALICIOUS"
         status = "REJECTED"
 
     elif llm_result.get("verdict") == "SUSPICIOUS":
-        final_verdict = "SUSPICIOUS"
-        status = "QUARANTINE"
+        non_docx_indicators = [
+            indicator
+            for indicator in indicators
+            if indicator != "DOCX external relationship detected"
+        ]
+
+        docx_only_external_link = (
+            type_info["actual_type"].lower() == "docx"
+            and docx_analysis
+            and docx_analysis.get("external_links") is True
+            and not docx_analysis.get("macro")
+            and not docx_analysis.get("embedded_objects")
+            and not docx_analysis.get("dde")
+            and not yara_matches
+            and not non_docx_indicators
+            and not interesting_imports
+        )
+
+        if docx_only_external_link:
+            final_verdict = "SAFE"
+            status = "APPROVED"
+        else:
+            final_verdict = "SUSPICIOUS"
+            status = "QUARANTINE"
 
     elif llm_result.get("verdict") == "ANALYSIS_ERROR":
         final_verdict = "ANALYSIS_ERROR"
@@ -773,6 +966,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "indicators": indicators,
         "yara_matches": yara_matches,
         "pdf_analysis": pdf_analysis,
+        "docx_analysis": docx_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
