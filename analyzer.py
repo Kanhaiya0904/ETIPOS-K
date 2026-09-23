@@ -2,6 +2,7 @@ import io
 import math
 import json
 import re
+import struct
 import zipfile
 import xml.etree.ElementTree as ET
 import openpyxl
@@ -676,6 +677,313 @@ def analyze_zip_static(data: bytes) -> dict:
         result["reason"] = f"ZIP parsing failed: {exc}"
         return result
 
+def analyze_image_static(data: bytes) -> dict:
+    """Inspect common image headers and bounded textual metadata only."""
+    result = {
+        "available": False,
+        "format": None,
+        "width": None,
+        "height": None,
+        "mode": None,
+        "animated": False,
+        "frame_count": None,
+        "metadata": {},
+        "urls": [],
+        "indicators": [],
+    }
+
+    max_metadata_fields = 20
+    max_metadata_value_length = 200
+    max_urls = 20
+    max_dimension = 20000
+    max_pixels = 200_000_000
+    suspicious_metadata_terms = {
+        "javascript", "powershell", "cmd.exe", "wscript", "<script",
+        "payload", "base64"
+    }
+
+    def add_url(value: str) -> None:
+        value = value.strip().rstrip(".,;)]}")
+        if value and value not in result["urls"] and len(result["urls"]) < max_urls:
+            result["urls"].append(value)
+
+    def add_metadata(key: str, value: object) -> None:
+        if len(result["metadata"]) >= max_metadata_fields:
+            return
+        text = str(value).replace("\x00", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return
+        text = text[:max_metadata_value_length]
+        result["metadata"][key[:80]] = text
+        for url in re.findall(
+            r"(?:https?|ftp)://[^\s<>\"']+",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            add_url(url)
+        lowered = text.lower()
+        if any(term in lowered for term in suspicious_metadata_terms):
+            result["indicators"].append(
+                f"IMAGE suspicious metadata field detected: {key[:80]}"
+            )
+
+    def set_dimensions(width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("invalid image dimensions")
+        result["width"] = width
+        result["height"] = height
+        if width > max_dimension or height > max_dimension:
+            result["indicators"].append(
+                f"IMAGE unusually large dimensions: {width}x{height}"
+            )
+        if width * height > max_pixels:
+            result["indicators"].append("IMAGE unusually large pixel count")
+
+    def skip_gif_subblocks(offset: int) -> int:
+        while offset < len(data):
+            block_size = data[offset]
+            offset += 1
+            if block_size == 0:
+                return offset
+            offset += block_size
+        return len(data)
+
+    def parse_png() -> None:
+        if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("invalid PNG signature")
+        width, height, bit_depth, color_type = struct.unpack(
+            ">IIBB", data[16:26]
+        )
+        modes = {0: "L", 2: "RGB", 3: "P", 4: "LA", 6: "RGBA"}
+        set_dimensions(width, height)
+        result["mode"] = modes.get(color_type, f"color_type_{color_type}")
+        result["metadata"]["bit_depth"] = bit_depth
+        offset = 8
+        frame_count = 1
+        chunks_seen = 0
+        while offset + 12 <= len(data) and chunks_seen < 10000:
+            length = struct.unpack(">I", data[offset:offset + 4])[0]
+            chunk_end = offset + 12 + length
+            if chunk_end > len(data):
+                break
+            chunk_type = data[offset + 4:offset + 8]
+            chunk_data = data[offset + 8:offset + 8 + length]
+            if chunk_type == b"acTL" and len(chunk_data) >= 8:
+                frame_count = struct.unpack(">I", chunk_data[:4])[0]
+            elif chunk_type == b"tEXt" and b"\x00" in chunk_data:
+                key, value = chunk_data.split(b"\x00", 1)
+                add_metadata(key.decode("latin-1", errors="ignore"), value.decode("latin-1", errors="ignore"))
+            elif chunk_type == b"iTXt":
+                fields = chunk_data.split(b"\x00", 5)
+                if len(fields) == 6:
+                    add_metadata(fields[0].decode("latin-1", errors="ignore"), fields[5].decode("utf-8", errors="ignore"))
+            offset = chunk_end
+            chunks_seen += 1
+        result["frame_count"] = frame_count
+        result["animated"] = frame_count > 1
+
+    def parse_gif() -> None:
+        if len(data) < 13 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+            raise ValueError("invalid GIF signature")
+        width, height = struct.unpack("<HH", data[6:10])
+        packed = data[10]
+        set_dimensions(width, height)
+        result["mode"] = "P"
+        offset = 13
+        if packed & 0x80:
+            offset += 3 * (2 ** ((packed & 0x07) + 1))
+        frames = 0
+        has_loop_extension = False
+        while offset < len(data) and frames < 10000:
+            marker = data[offset]
+            offset += 1
+            if marker == 0x3B:
+                break
+            if marker == 0x2C:
+                if offset + 9 > len(data):
+                    break
+                image_packed = data[offset + 8]
+                offset += 9
+                if image_packed & 0x80:
+                    offset += 3 * (2 ** ((image_packed & 0x07) + 1))
+                if offset >= len(data):
+                    break
+                offset += 1
+                offset = skip_gif_subblocks(offset)
+                frames += 1
+            elif marker == 0x21:
+                if offset >= len(data):
+                    break
+                label = data[offset]
+                offset += 1
+                if label == 0xFE:
+                    comment_start = offset
+                    offset = skip_gif_subblocks(offset)
+                    add_metadata("comment", data[comment_start:offset].decode("latin-1", errors="ignore"))
+                elif label == 0xFF:
+                    if offset >= len(data):
+                        break
+                    block_size = data[offset]
+                    app_start = offset + 1
+                    offset = skip_gif_subblocks(app_start + block_size)
+                    if b"NETSCAPE" in data[app_start:app_start + block_size]:
+                        has_loop_extension = True
+                else:
+                    offset = skip_gif_subblocks(offset)
+            else:
+                break
+        result["frame_count"] = frames
+        result["animated"] = frames > 1 or has_loop_extension
+
+    def parse_jpeg() -> None:
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            raise ValueError("invalid JPEG signature")
+        offset = 2
+        frames = 0
+        while offset + 4 <= len(data) and frames < 10000:
+            while offset < len(data) and data[offset] != 0xFF:
+                offset += 1
+            while offset < len(data) and data[offset] == 0xFF:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker in {0xD8, 0xD9}:
+                continue
+            if marker == 0xDA:
+                break
+            if offset + 2 > len(data):
+                break
+            segment_length = struct.unpack(">H", data[offset:offset + 2])[0]
+            if segment_length < 2 or offset + segment_length > len(data):
+                break
+            segment = data[offset + 2:offset + segment_length]
+            if marker in set(range(0xC0, 0xC4)) | set(range(0xC5, 0xC8)) | set(range(0xC9, 0xCC)) | set(range(0xCD, 0xD0)):
+                if len(segment) >= 6:
+                    height, width, components = struct.unpack(">HHB", segment[1:6])
+                    set_dimensions(width, height)
+                    result["mode"] = {1: "L", 3: "RGB", 4: "CMYK"}.get(components, f"components_{components}")
+                    frames += 1
+            elif marker == 0xE1 and segment.startswith(b"Exif\x00\x00"):
+                result["metadata"]["exif_present"] = True
+                for text in re.findall(rb"[ -~]{4,}", segment[6:]):
+                    add_metadata("exif_text", text.decode("latin-1", errors="ignore"))
+            elif marker == 0xFE:
+                add_metadata("comment", segment)
+            offset += segment_length
+        result["frame_count"] = frames or 1
+
+    def parse_bmp() -> None:
+        if len(data) < 26 or data[:2] != b"BM":
+            raise ValueError("invalid BMP signature")
+        dib_size = struct.unpack("<I", data[14:18])[0]
+        if dib_size < 12 or len(data) < 14 + dib_size:
+            raise ValueError("invalid BMP header")
+        if dib_size == 12:
+            width, height, planes, bits = struct.unpack("<HHHH", data[18:26])
+        else:
+            width, height, planes, bits = struct.unpack("<iiHH", data[18:30])
+            height = abs(height)
+        set_dimensions(width, height)
+        result["mode"] = {1: "1", 4: "P", 8: "P", 16: "RGB", 24: "RGB", 32: "RGBA"}.get(bits, f"bits_{bits}")
+        result["metadata"]["bits_per_pixel"] = bits
+
+    def parse_tiff() -> None:
+        if len(data) < 8 or data[:2] not in {b"II", b"MM"}:
+            raise ValueError("invalid TIFF byte order")
+        endian = "<" if data[:2] == b"II" else ">"
+        if struct.unpack(endian + "H", data[2:4])[0] != 42:
+            raise ValueError("invalid TIFF signature")
+        ifd_offset = struct.unpack(endian + "I", data[4:8])[0]
+        frames = 0
+        while ifd_offset and ifd_offset + 2 <= len(data) and frames < 100:
+            count = struct.unpack(endian + "H", data[ifd_offset:ifd_offset + 2])[0]
+            entries_end = ifd_offset + 2 + count * 12
+            if entries_end + 4 > len(data):
+                break
+            values = {}
+            for index in range(count):
+                entry = ifd_offset + 2 + index * 12
+                tag, value_type, value_count = struct.unpack(endian + "HHI", data[entry:entry + 8])
+                value_size = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8}.get(value_type, 0) * value_count
+                raw = data[entry + 8:entry + 12] if value_size <= 4 else data[struct.unpack(endian + "I", data[entry + 8:entry + 12])[0]:][:value_size]
+                if value_type == 3 and len(raw) >= 2:
+                    values[tag] = struct.unpack(endian + "H", raw[:2])[0]
+                elif value_type == 4 and len(raw) >= 4:
+                    values[tag] = struct.unpack(endian + "I", raw[:4])[0]
+                elif value_type == 2:
+                    add_metadata(f"tiff_{tag}", raw.decode("latin-1", errors="ignore"))
+            if 256 in values and 257 in values:
+                set_dimensions(values[256], values[257])
+            result["mode"] = {1: "L", 2: "RGB", 5: "CMYK"}.get(values.get(262), "RGB")
+            frames += 1
+            ifd_offset = struct.unpack(endian + "I", data[entries_end:entries_end + 4])[0]
+        if frames == 0 or result["width"] is None:
+            raise ValueError("TIFF dimensions unavailable")
+        result["frame_count"] = frames
+        result["animated"] = frames > 1
+
+    def parse_webp() -> None:
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            raise ValueError("invalid WEBP signature")
+        offset = 12
+        frames = 0
+        animation_flag = False
+        while offset + 8 <= len(data) and frames < 10000:
+            chunk_type = data[offset:offset + 4]
+            chunk_size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
+            chunk_start = offset + 8
+            chunk_end = chunk_start + chunk_size
+            if chunk_end > len(data):
+                break
+            chunk = data[chunk_start:chunk_end]
+            if chunk_type == b"VP8X" and len(chunk) >= 10:
+                flags = chunk[0]
+                animation_flag = bool(flags & 0x02)
+                width = 1 + int.from_bytes(chunk[4:7], "little")
+                height = 1 + int.from_bytes(chunk[7:10], "little")
+                set_dimensions(width, height)
+                result["mode"] = "RGBA" if flags & 0x10 else "RGB"
+            elif chunk_type == b"ANIM":
+                animation_flag = True
+            elif chunk_type == b"ANMF":
+                frames += 1
+            offset = chunk_end + (chunk_size & 1)
+        result["frame_count"] = frames or 1
+        result["animated"] = animation_flag or frames > 1
+
+    try:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            result["format"] = "PNG"
+            parse_png()
+        elif data[:6] in {b"GIF87a", b"GIF89a"}:
+            result["format"] = "GIF"
+            parse_gif()
+        elif data[:2] == b"\xff\xd8":
+            result["format"] = "JPEG"
+            parse_jpeg()
+        elif data[:2] == b"BM":
+            result["format"] = "BMP"
+            parse_bmp()
+        elif data[:2] in {b"II", b"MM"}:
+            result["format"] = "TIFF"
+            parse_tiff()
+        elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            result["format"] = "WEBP"
+            parse_webp()
+        else:
+            raise ValueError("unsupported or malformed image format")
+        result["available"] = True
+        if result["animated"]:
+            result["indicators"].append("IMAGE animated/multi-frame content detected")
+        result["indicators"] = list(dict.fromkeys(result["indicators"]))
+        return result
+    except Exception as exc:
+        result["reason"] = f"Image parsing failed: {exc}"
+        return result
+
 def extract_interesting_imports(lief_analysis: dict) -> list[dict]:
     """
     Classify potentially interesting imported Windows APIs.
@@ -873,6 +1181,7 @@ File details:
 - XLSX static analysis: {context.get('xlsx_analysis')}
 - PPTX static analysis: {context.get('pptx_analysis')}
 - ZIP static analysis: {context.get('zip_analysis')}
+- IMAGE static analysis: {context.get('image_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
 DOCX interpretation guidance:
@@ -913,6 +1222,13 @@ ZIP static analysis guidance:
 - Never confuse ZIP findings with DOCX, XLSX, or PPTX findings.
 - If zip_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed indicator(s).
 - Do not claim that no suspicious indicators were detected when zip_analysis.indicators is non-empty.
+
+IMAGE static analysis guidance:
+- Image findings are static-analysis evidence only. EXIF metadata, large dimensions, animation, multiple frames, and URLs in image metadata do not automatically prove malicious behavior.
+- Do not invent payloads, scripts, execution behavior, exploits, or malware capabilities. Only mention metadata and indicators explicitly present in image_analysis.
+- Never confuse image findings with PDF, DOCX, XLSX, PPTX, or ZIP findings.
+- If image_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed indicator(s).
+- Do not claim that no suspicious indicators were detected when image_analysis.indicators is non-empty.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -1317,6 +1633,17 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         zip_analysis = analyze_zip_static(data)
         indicators.extend(zip_analysis.get("indicators", []))
 
+    image_analysis = None
+    image_types = {"jpeg", "jpg", "png", "gif", "bmp", "tiff", "webp"}
+    is_image_file = (
+        actual_type in image_types
+        or mime_type.startswith("image/")
+    )
+
+    if is_image_file:
+        image_analysis = analyze_image_static(data)
+        indicators.extend(image_analysis.get("indicators", []))
+
     lief_analysis = None
     interesting_imports = []
 
@@ -1338,6 +1665,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "xlsx_analysis": xlsx_analysis,
         "pptx_analysis": pptx_analysis,
         "zip_analysis": zip_analysis,
+        "image_analysis": image_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -1468,6 +1796,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "xlsx_analysis": xlsx_analysis,
         "pptx_analysis": pptx_analysis,
         "zip_analysis": zip_analysis,
+        "image_analysis": image_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
