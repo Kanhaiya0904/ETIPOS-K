@@ -506,6 +506,176 @@ def analyze_executable_lief(data: bytes) -> dict:
             "reason": f"LIEF analysis failed: {str(e)}"
         }
 
+def analyze_zip_static(data: bytes) -> dict:
+    """Inspect ZIP metadata and bounded textual content without extraction."""
+    result = {
+        "available": False,
+        "member_count": 0,
+        "total_uncompressed_size": 0,
+        "total_compressed_size": 0,
+        "compression_ratio": None,
+        "nested_archives": False,
+        "executables": [],
+        "scripts": [],
+        "suspicious_paths": [],
+        "encrypted_members": False,
+        "urls": [],
+        "indicators": [],
+    }
+
+    max_members = 10000
+    max_total_uncompressed = 512 * 1024 * 1024
+    max_total_compressed = 128 * 1024 * 1024
+    max_text_member_size = 256 * 1024
+    max_text_bytes = 2 * 1024 * 1024
+    max_report_items = 100
+    max_name_length = 160
+    max_path_depth = 8
+    executable_extensions = {
+        ".exe", ".dll", ".scr", ".com", ".msi", ".sys", ".cpl"
+    }
+    script_extensions = {
+        ".ps1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+        ".wsf", ".wsh", ".hta", ".py", ".sh"
+    }
+    archive_extensions = {
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"
+    }
+    text_extensions = {
+        ".txt", ".csv", ".json", ".xml", ".html", ".htm", ".js",
+        ".jse", ".ps1", ".bat", ".cmd", ".vbs", ".vbe", ".wsf",
+        ".wsh", ".hta", ".py", ".sh", ".ini", ".cfg", ".conf",
+        ".yml", ".yaml", ".md", ".url"
+    }
+
+    def bounded_name(name: str) -> str:
+        name = str(name)
+        if len(name) <= max_name_length:
+            return name
+        return name[:max_name_length - 3] + "..."
+
+    def add_unique(field: str, value: str) -> None:
+        values = result[field]
+        if value not in values and len(values) < max_report_items:
+            values.append(value)
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+            infos = archive.infolist()
+            result["available"] = True
+            result["member_count"] = len(infos)
+            text_bytes_read = 0
+
+            for info in infos:
+                name = str(info.filename)
+                safe_name = bounded_name(name)
+                lower_name = name.lower()
+                suffix = lower_name.rsplit(".", 1)[-1] if "." in lower_name else ""
+                suffix = "." + suffix if suffix else ""
+                result["total_uncompressed_size"] += max(info.file_size, 0)
+                result["total_compressed_size"] += max(info.compress_size, 0)
+
+                if suffix in executable_extensions:
+                    add_unique("executables", safe_name)
+                    result["indicators"].append(
+                        f"ZIP executable member detected: {safe_name}"
+                    )
+
+                if suffix in script_extensions:
+                    add_unique("scripts", safe_name)
+                    result["indicators"].append(
+                        f"ZIP script member detected: {safe_name}"
+                    )
+
+                if suffix in archive_extensions:
+                    result["nested_archives"] = True
+                    result["indicators"].append(
+                        f"ZIP nested archive detected: {safe_name}"
+                    )
+
+                normalized_path = name.replace("\\", "/")
+                path_parts = [part for part in normalized_path.split("/") if part]
+                is_absolute = (
+                    normalized_path.startswith("/")
+                    or normalized_path.startswith("\\")
+                    or bool(re.match(r"^[a-zA-Z]:/", normalized_path))
+                )
+                has_traversal = ".." in path_parts
+                is_too_deep = len(path_parts) > max_path_depth
+                if is_absolute or has_traversal or is_too_deep:
+                    add_unique("suspicious_paths", safe_name)
+                    result["indicators"].append(
+                        f"ZIP suspicious path detected: {safe_name}"
+                    )
+
+                if info.flag_bits & 0x1:
+                    result["encrypted_members"] = True
+                    result["indicators"].append(
+                        "ZIP encrypted member detected"
+                    )
+
+                if (
+                    not info.is_dir()
+                    and suffix in text_extensions
+                    and info.file_size <= max_text_member_size
+                    and text_bytes_read < max_text_bytes
+                ):
+                    read_size = min(
+                        info.file_size,
+                        max_text_member_size,
+                        max_text_bytes - text_bytes_read,
+                    )
+                    try:
+                        with archive.open(info, "r") as member:
+                            content = member.read(read_size)
+                        text_bytes_read += len(content)
+                        text = content.decode("utf-8", errors="ignore")
+                        for url in re.findall(
+                            r"(?:https?|ftp)://[^\s<>\"']+",
+                            text,
+                            flags=re.IGNORECASE,
+                        ):
+                            add_unique("urls", url.rstrip(".,;)]}"))
+                    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+                        continue
+
+            if result["total_compressed_size"] > 0:
+                result["compression_ratio"] = round(
+                    result["total_uncompressed_size"]
+                    / result["total_compressed_size"],
+                    2,
+                )
+
+            if len(infos) > max_members:
+                result["indicators"].append(
+                    "ZIP member count is unusually large"
+                )
+            if result["total_uncompressed_size"] > max_total_uncompressed:
+                result["indicators"].append(
+                    "ZIP total uncompressed size is unusually large"
+                )
+            if result["total_compressed_size"] > max_total_compressed:
+                result["indicators"].append(
+                    "ZIP total compressed size is unusually large"
+                )
+            if (
+                result["compression_ratio"] is not None
+                and result["compression_ratio"] >= 100
+                and result["total_uncompressed_size"] >= 1024 * 1024
+            ):
+                result["indicators"].append(
+                    "ZIP high compression ratio observed"
+                )
+
+            result["indicators"] = list(
+                dict.fromkeys(result["indicators"])
+            )[:max_report_items]
+            return result
+
+    except Exception as exc:
+        result["reason"] = f"ZIP parsing failed: {exc}"
+        return result
+
 def extract_interesting_imports(lief_analysis: dict) -> list[dict]:
     """
     Classify potentially interesting imported Windows APIs.
@@ -686,7 +856,10 @@ def llm_worst_case_analysis(data: bytes, filename: str, context: Dict[str, Any])
 
     system_prompt = f"""You are a local malware triage model. Use the supplied static-analysis evidence as the authoritative context. Do not invent malicious behavior. Never mention an indicator that is not present in the evidence. API names alone do not prove malware. Common PowerShell references alone do not prove malware. Do not infer PowerShell unless PowerShell is explicitly present in the indicators, YARA matches, or supplied snippet.
 
+If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware. For DOCX files, external relationships, ordinary hyperlinks, embedded objects, and VBA macro projects are static-analysis findings that must be considered in context; their presence alone does not automatically prove malicious behavior. PPTX findings must be interpreted the same way: macros, embedded objects, external relationships, URLs, and action or hyperlink elements are evidence only and do not alone prove malicious behavior. ZIP findings are static-analysis evidence only: executable or script members, nested archives, encryption, suspicious paths, and compression/resource-abuse indicators do not automatically prove malicious behavior.
 If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware. For DOCX files, external relationships, ordinary hyperlinks, embedded objects, and VBA macro projects are static-analysis findings that must be considered in context; their presence alone does not automatically prove malicious behavior. PPTX findings must be interpreted the same way: macros, embedded objects, external relationships, URLs, and action or hyperlink elements are evidence only and do not alone prove malicious behavior.
+
+ZIP findings are static-analysis evidence only: executable or script members, nested archives, encryption, suspicious paths, and compression/resource-abuse indicators do not automatically prove malicious behavior.
 
 File details:
 - Filename: {filename}
@@ -699,6 +872,7 @@ File details:
 - DOCX static analysis: {context.get('docx_analysis')}
 - XLSX static analysis: {context.get('xlsx_analysis')}
 - PPTX static analysis: {context.get('pptx_analysis')}
+- ZIP static analysis: {context.get('zip_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
 DOCX interpretation guidance:
@@ -732,6 +906,13 @@ PPTX static analysis: treat the reported findings as static-analysis evidence on
 - Never claim a macro, embedded object, external relationship, URL, or action exists unless it is explicitly present in pptx_analysis.
 - If pptx_analysis.indicators is non-empty, the reason must explicitly acknowledge the actual indicator(s).
 - Do not say that no suspicious indicators were detected when pptx_analysis.indicators is non-empty.
+
+ZIP static analysis guidance:
+- ZIP findings are static-analysis evidence only. An executable or script member, nested archive, encryption, suspicious path, or compression/resource-abuse indicator does not automatically prove malicious behavior.
+- Do not invent commands, payloads, execution behavior, URLs, or malware capabilities. Only mention files and indicators explicitly present in zip_analysis.
+- Never confuse ZIP findings with DOCX, XLSX, or PPTX findings.
+- If zip_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed indicator(s).
+- Do not claim that no suspicious indicators were detected when zip_analysis.indicators is non-empty.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -1111,6 +1292,31 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             pptx_analysis.get("indicators", [])
         )
 
+    actual_type = type_info["actual_type"].lower()
+    mime_type = type_info["mime_type"].lower()
+    office_package_detected = (
+        actual_type in {"docx", "xlsx", "pptx"}
+        or mime_type in {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+    )
+    is_zip_archive = (
+        not office_package_detected
+        and (
+            actual_type in {"zip", "zip archive"}
+            or mime_type in {"application/zip", "application/x-zip-compressed"}
+            or zipfile.is_zipfile(io.BytesIO(data))
+        )
+    )
+
+    zip_analysis = None
+
+    if is_zip_archive:
+        zip_analysis = analyze_zip_static(data)
+        indicators.extend(zip_analysis.get("indicators", []))
+
     lief_analysis = None
     interesting_imports = []
 
@@ -1131,6 +1337,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "docx_analysis": docx_analysis,
         "xlsx_analysis": xlsx_analysis,
         "pptx_analysis": pptx_analysis,
+        "zip_analysis": zip_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -1260,6 +1467,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "docx_analysis": docx_analysis,
         "xlsx_analysis": xlsx_analysis,
         "pptx_analysis": pptx_analysis,
+        "zip_analysis": zip_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
