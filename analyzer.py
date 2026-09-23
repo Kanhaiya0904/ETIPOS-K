@@ -4,6 +4,7 @@ import json
 import re
 import lief
 import yara
+from PyPDF2 import PdfReader
 from typing import Dict, Any, Optional, Tuple
 import clamd
 from magika import Magika
@@ -130,6 +131,200 @@ def scan_yara(data: bytes) -> list[dict]:
     except Exception as e:
         print(f"YARA scan error: {e}")
         return []
+
+def analyze_pdf_static(data: bytes) -> dict:
+    """Inspect PDF metadata, actions, and URLs without assigning a verdict."""
+    result = {
+        "available": False,
+        "page_count": None,
+        "javascript": False,
+        "open_action": False,
+        "additional_actions": False,
+        "embedded_files": False,
+        "launch_actions": False,
+        "uri_actions": False,
+        "acroform": False,
+        "urls": [],
+        "indicators": [],
+    }
+
+    urls = []
+    visited = set()
+
+    def add_url(url: str) -> None:
+        url = url.strip()
+        if url and url not in urls:
+            urls.append(url)
+
+    def inspect_text(value: object) -> None:
+        try:
+            text = str(value)
+        except Exception:
+            return
+
+        for url in re.findall(
+            r"(?:https?|ftp)://[^\s<>\"']+",
+            text,
+            re.IGNORECASE,
+        ):
+            add_url(url.rstrip(".,;)]}"))
+
+    def resolve(value: object) -> object:
+        seen = set()
+
+        try:
+            while hasattr(value, "get_object"):
+                object_id = id(value)
+
+                if object_id in seen:
+                    return None
+
+                seen.add(object_id)
+                value = value.get_object()
+
+        except Exception:
+            return None
+
+        return value
+
+    def walk(value: object) -> None:
+        try:
+            if hasattr(value, "get_object"):
+                value = value.get_object()
+        except Exception:
+            return
+
+        object_id = id(value)
+        if object_id in visited:
+            return
+        visited.add(object_id)
+
+        inspect_text(value)
+
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_name = str(key).lower()
+                child_name = str(child).lower()
+
+                if key_name in {"/js", "/javascript"}:
+                    result["javascript"] = True
+
+                if key_name == "/s" and child_name == "/javascript":
+                    result["javascript"] = True
+
+                if key_name == "/openaction":
+                    result["open_action"] = True
+
+                if key_name == "/aa":
+                    result["additional_actions"] = True
+
+                if key_name in {"/embeddedfiles", "/ef"}:
+                    result["embedded_files"] = True
+
+                if key_name == "/s" and child_name == "/launch":
+                    result["launch_actions"] = True
+
+                if key_name in {"/uri", "/url"}:
+                    result["uri_actions"] = True
+
+                if key_name == "/s" and child_name == "/uri":
+                    result["uri_actions"] = True
+
+                if key_name == "/acroform":
+                    result["acroform"] = True
+
+                walk(key)
+                walk(child)
+
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child)
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        result["available"] = True
+        result["page_count"] = len(reader.pages)
+
+        root = reader.trailer.get("/Root")
+        walk(root)
+
+        for page in reader.pages:
+            page_object = resolve(page)
+
+            if not isinstance(page_object, dict):
+                continue
+
+            annotations = resolve(page_object.get("/Annots"))
+
+            if annotations is not None and not isinstance(
+                annotations, (list, tuple)
+            ):
+                annotations = [annotations]
+
+            for annotation_reference in annotations or []:
+                annotation = resolve(annotation_reference)
+
+                if not isinstance(annotation, dict):
+                    continue
+
+                action = resolve(annotation.get("/A"))
+
+                if not isinstance(action, dict):
+                    continue
+
+                action_type = resolve(action.get("/S"))
+
+                if str(action_type).lower() != "/uri":
+                    continue
+
+                result["uri_actions"] = True
+
+                uri = resolve(action.get("/URI"))
+
+                if uri is not None:
+                    add_url(str(uri))
+
+            walk(page)
+
+    except Exception as e:
+        result["reason"] = f"PDF parsing failed: {str(e)}"
+
+    raw_text = data.decode("latin-1", errors="ignore")
+    inspect_text(raw_text)
+
+    raw_markers = {
+        "javascript": r"/(?:JS|JavaScript)\b",
+        "open_action": r"/OpenAction\b",
+        "additional_actions": r"/AA\b",
+        "embedded_files": r"/(?:EmbeddedFiles|EF)\b",
+        "launch_actions": r"/Launch\b",
+        "uri_actions": r"/(?:URI|URL)\b",
+        "acroform": r"/AcroForm\b",
+    }
+
+    for field, pattern in raw_markers.items():
+        if re.search(pattern, raw_text, re.IGNORECASE):
+            result[field] = True
+
+    result["urls"] = urls[:20]
+
+    evidence = [
+        ("javascript", "PDF JavaScript detected"),
+        ("open_action", "PDF OpenAction detected"),
+        ("additional_actions", "PDF additional actions detected"),
+        ("embedded_files", "PDF embedded files detected"),
+        ("launch_actions", "PDF Launch action detected"),
+        ("uri_actions", "PDF URI action detected"),
+        ("acroform", "PDF AcroForm detected"),
+    ]
+
+    result["indicators"] = [
+        message
+        for field, message in evidence
+        if result[field]
+    ]
+
+    return result
 
 def analyze_executable_lief(data: bytes) -> dict:
     """
@@ -361,7 +556,7 @@ def llm_worst_case_analysis(data: bytes, filename: str, context: Dict[str, Any])
 
     system_prompt = f"""You are a local malware triage model. Use the supplied static-analysis evidence as the authoritative context. Do not invent malicious behavior. Never mention an indicator that is not present in the evidence. API names alone do not prove malware. Common PowerShell references alone do not prove malware. Do not infer PowerShell unless PowerShell is explicitly present in the indicators, YARA matches, or supplied snippet.
 
-If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. If the evidence is weak or generic text, use SAFE with cautious wording. Do not invent reverse shells, download behavior, encoded commands, script-host execution, or other traits unless they are clearly present in the supplied evidence. The reason must be directly supported by the static-analysis evidence.
+If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware.
 
 File details:
 - Filename: {filename}
@@ -370,6 +565,9 @@ File details:
 - Entropy: {context.get('entropy')}
 - Indicators: {context.get('indicators')}
 - YARA matches: {context.get('yara_matches')}
+- PDF static analysis: {context.get('pdf_analysis')}
+- LIEF analysis: {context.get('lief_analysis')}
+
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -491,6 +689,17 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     entropy = calculate_entropy(data)
     indicators = extract_suspicious_indicators(data)
     yara_matches = scan_yara(data)
+
+    pdf_analysis = None
+
+    if (
+        type_info["actual_type"].lower() == "pdf"
+        or type_info["mime_type"].lower() == "application/pdf"
+    ):
+        pdf_analysis = analyze_pdf_static(data)
+
+        indicators.extend(pdf_analysis.get("indicators", []))
+
     lief_analysis = None
     interesting_imports = []
 
@@ -507,7 +716,8 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "entropy": entropy,
         "indicators": indicators,
         "yara_matches": yara_matches,
-        "lief_analysis": lief_analysis
+        "pdf_analysis": pdf_analysis,
+        "lief_analysis": lief_analysis,
     }
 
     # Criteria to invoke Tier 3 AI Specialist:
@@ -562,6 +772,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "entropy": entropy,
         "indicators": indicators,
         "yara_matches": yara_matches,
+        "pdf_analysis": pdf_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
