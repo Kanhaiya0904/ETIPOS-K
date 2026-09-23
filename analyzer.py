@@ -4,6 +4,7 @@ import json
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+import openpyxl
 import lief
 import yara
 from PyPDF2 import PdfReader
@@ -696,6 +697,7 @@ File details:
 - YARA matches: {context.get('yara_matches')}
 - PDF static analysis: {context.get('pdf_analysis')}
 - DOCX static analysis: {context.get('docx_analysis')}
+- XLSX static analysis: {context.get('xlsx_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
 DOCX interpretation guidance:
@@ -708,6 +710,19 @@ DOCX interpretation guidance:
 - If static-analysis indicators are present but there is no direct evidence of malicious behavior, SAFE may still be returned, but the reason MUST state the detected finding and explain that it is not sufficient by itself to establish malicious behavior.
 - Treat "embedded objects", "embedded files", "OLE objects", and "macro projects" as distinct findings.
 - Never invent macro behavior, payloads, commands, network activity, or execution behavior that was not observed.
+
+XLSX static analysis: treat the reported findings as static-analysis evidence only.
+- A VBA macro project means macro code is present, but does not by itself prove malicious behavior.
+- Embedded objects do not by themselves prove malicious behavior.
+- An external relationship or URL does not by itself prove malicious behavior.
+- An Excel 4.0 macro sheet is a static finding; do not invent what the macro does.
+- DDE-related formula content is a static finding; do not invent execution behavior.
+- Excel add-in content is a static finding; do not invent payloads, commands, or malicious behavior.
+- Never describe an XLSX finding as a DOCX finding.
+- When multiple XLSX indicators are present, mention the actual XLSX indicators by name and do not refer to the file as DOCX or another file type.
+- Never claim a macro, embedded object, DDE, external relationship, Excel 4.0 macro sheet, or add-in exists unless it is explicitly present in xlsx_analysis.
+- If xlsx_analysis.indicators is non-empty, the reason must explicitly acknowledge the actual indicator(s).
+- Do not say that no suspicious indicators were detected when xlsx_analysis.indicators is non-empty.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -800,6 +815,130 @@ Keep reason to one sentence, no markdown, no backticks, no extra text, and no ba
             "flagged_traits": ["LLM returned invalid JSON"],
         }
 
+def analyze_xlsx_static(data: bytes) -> dict:
+    result = {
+        "available": False,
+        "macro": False,
+        "embedded_objects": False,
+        "external_links": False,
+        "dde": False,
+        "excel_4_macro_sheets": False,
+        "add_in": False,
+        "urls": [],
+        "indicators": [],
+    }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as z:
+            names = z.namelist()
+            result["available"] = True
+
+            # VBA macro project detection
+            if any(name.lower().endswith("vbaProject.bin".lower()) for name in names):
+                result["macro"] = True
+                result["indicators"].append(
+                    "XLSX VBA macro project detected"
+                )
+
+            # Embedded OLE/object detection
+            if any(
+                name.lower().startswith("xl/embeddings/")
+                for name in names
+            ):
+                result["embedded_objects"] = True
+                result["indicators"].append(
+                    "XLSX embedded objects detected"
+                )
+
+            # Excel 4.0 macro sheet detection
+            if any(
+                name.lower().startswith("xl/macrosheets/")
+                for name in names
+            ):
+                result["excel_4_macro_sheets"] = True
+                result["indicators"].append(
+                    "Excel 4.0 macro sheet detected"
+                )
+
+            # Excel add-in content detection
+            if any(
+                name.lower().startswith("xl/addins/")
+                for name in names
+            ):
+                result["add_in"] = True
+                result["indicators"].append(
+                    "Excel add-in content detected"
+                )
+
+            # External relationship and URL detection
+            for name in names:
+                if not name.lower().endswith(".rels"):
+                    continue
+
+                content = z.read(name).decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+
+                if 'TargetMode="External"' in content:
+                    result["external_links"] = True
+                    result["indicators"].append(
+                        "XLSX external relationship detected"
+                    )
+
+                urls = re.findall(
+                    r'https?://[^\s"<>\']+',
+                    content,
+                    flags=re.IGNORECASE
+                )
+
+                for url in urls:
+                    if (
+                        "schemas.openxmlformats.org" not in url
+                        and "schemas.microsoft.com" not in url
+                        and url not in result["urls"]
+                    ):
+                        result["urls"].append(url)
+
+            # Search worksheet/formula XML for DDE indicators
+            for name in names:
+                lower_name = name.lower()
+
+                if not (
+                    lower_name.endswith(".xml")
+                    and (
+                        lower_name.startswith("xl/worksheets/")
+                        or lower_name.startswith("xl/charts/")
+                    )
+                ):
+                    continue
+
+                content = z.read(name).decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+
+                lower_content = content.lower()
+
+                if (
+                    "ddeauto" in lower_content
+                    or "dde" in lower_content
+                    and "instrtext" in lower_content
+                ):
+                    result["dde"] = True
+                    result["indicators"].append(
+                        "XLSX DDE-related formula content detected"
+                    )
+
+            result["indicators"] = list(
+                dict.fromkeys(result["indicators"])
+            )
+
+            return result
+
+    except Exception:
+        return result
+
 def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     """
     Orchestrates the entire multi-tier pipeline:
@@ -860,6 +999,19 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             docx_analysis.get("indicators", [])
         )
 
+    xlsx_analysis = None
+
+    if (
+        type_info["actual_type"].lower() == "xlsx"
+        or type_info["mime_type"].lower()
+        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ):
+        xlsx_analysis = analyze_xlsx_static(data)
+
+        indicators.extend(
+            xlsx_analysis.get("indicators", [])
+        )
+
     lief_analysis = None
     interesting_imports = []
 
@@ -878,6 +1030,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "yara_matches": yara_matches,
         "pdf_analysis": pdf_analysis,
         "docx_analysis": docx_analysis,
+        "xlsx_analysis": xlsx_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -912,7 +1065,13 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             and docx_analysis.get("macro") is True
         )
 
-        if docx_macro_detected:
+        xlsx_macro_detected = (
+            type_info["actual_type"].lower() == "xlsx"
+            and xlsx_analysis
+            and xlsx_analysis.get("macro") is True
+        )
+
+        if docx_macro_detected or xlsx_macro_detected:
             final_verdict = "SUSPICIOUS"
             status = "QUARANTINE"
         else:
@@ -942,7 +1101,21 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             and not interesting_imports
         )
 
-        if docx_only_external_link:
+        xlsx_only_external_link = (
+            type_info["actual_type"].lower() == "xlsx"
+            and xlsx_analysis
+            and xlsx_analysis.get("external_links") is True
+            and not xlsx_analysis.get("macro")
+            and not xlsx_analysis.get("embedded_objects")
+            and not xlsx_analysis.get("dde")
+            and not xlsx_analysis.get("excel_4_macro_sheets")
+            and not xlsx_analysis.get("add_in")
+            and not yara_matches
+            and not interesting_imports
+            and indicators == ["XLSX external relationship detected"]
+        )
+
+        if docx_only_external_link or xlsx_only_external_link:
             final_verdict = "SAFE"
             status = "APPROVED"
         else:
@@ -967,6 +1140,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "yara_matches": yara_matches,
         "pdf_analysis": pdf_analysis,
         "docx_analysis": docx_analysis,
+        "xlsx_analysis": xlsx_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
