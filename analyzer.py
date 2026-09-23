@@ -686,7 +686,7 @@ def llm_worst_case_analysis(data: bytes, filename: str, context: Dict[str, Any])
 
     system_prompt = f"""You are a local malware triage model. Use the supplied static-analysis evidence as the authoritative context. Do not invent malicious behavior. Never mention an indicator that is not present in the evidence. API names alone do not prove malware. Common PowerShell references alone do not prove malware. Do not infer PowerShell unless PowerShell is explicitly present in the indicators, YARA matches, or supplied snippet.
 
-If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware. For DOCX files, external relationships, ordinary hyperlinks, embedded objects, and VBA macro projects are static-analysis findings that must be considered in context; their presence alone does not automatically prove malicious behavior.
+If the supplied evidence directly shows executable APIs or YARA injection indicators, prefer SUSPICIOUS and explain only the observed evidence. For PDF files, JavaScript, OpenAction, additional actions, embedded files, Launch actions, and suspicious URI actions are static-analysis indicators that must be explicitly considered in the assessment. Their presence alone does not automatically prove malware. For DOCX files, external relationships, ordinary hyperlinks, embedded objects, and VBA macro projects are static-analysis findings that must be considered in context; their presence alone does not automatically prove malicious behavior. PPTX findings must be interpreted the same way: macros, embedded objects, external relationships, URLs, and action or hyperlink elements are evidence only and do not alone prove malicious behavior.
 
 File details:
 - Filename: {filename}
@@ -698,6 +698,7 @@ File details:
 - PDF static analysis: {context.get('pdf_analysis')}
 - DOCX static analysis: {context.get('docx_analysis')}
 - XLSX static analysis: {context.get('xlsx_analysis')}
+- PPTX static analysis: {context.get('pptx_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
 DOCX interpretation guidance:
@@ -723,6 +724,14 @@ XLSX static analysis: treat the reported findings as static-analysis evidence on
 - Never claim a macro, embedded object, DDE, external relationship, Excel 4.0 macro sheet, or add-in exists unless it is explicitly present in xlsx_analysis.
 - If xlsx_analysis.indicators is non-empty, the reason must explicitly acknowledge the actual indicator(s).
 - Do not say that no suspicious indicators were detected when xlsx_analysis.indicators is non-empty.
+
+PPTX static analysis: treat the reported findings as static-analysis evidence only.
+- A VBA macro project means macro code is present, but does not by itself prove malicious behavior.
+- Embedded objects, external relationships, URLs, and action or hyperlink elements do not by themselves prove malicious behavior.
+- Never describe a PPTX finding as a DOCX or XLSX finding.
+- Never claim a macro, embedded object, external relationship, URL, or action exists unless it is explicitly present in pptx_analysis.
+- If pptx_analysis.indicators is non-empty, the reason must explicitly acknowledge the actual indicator(s).
+- Do not say that no suspicious indicators were detected when pptx_analysis.indicators is non-empty.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -939,6 +948,83 @@ def analyze_xlsx_static(data: bytes) -> dict:
     except Exception:
         return result
 
+def analyze_pptx_static(data: bytes) -> dict:
+    """Inspect PPTX package structures without assigning a malware verdict."""
+    result = {
+        "available": False,
+        "macro": False,
+        "embedded_objects": False,
+        "external_links": False,
+        "actions": False,
+        "urls": [],
+        "indicators": [],
+    }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as z:
+            names = z.namelist()
+            result["available"] = True
+
+            if any(name.lower().endswith("vbaproject.bin") for name in names):
+                result["macro"] = True
+                result["indicators"].append("PPTX VBA macro project detected")
+
+            if any(name.lower().startswith("ppt/embeddings/") for name in names):
+                result["embedded_objects"] = True
+                result["indicators"].append("PPTX embedded objects detected")
+
+            for name in names:
+                if not name.lower().endswith(".rels"):
+                    continue
+
+                content = z.read(name).decode("utf-8", errors="ignore")
+                if 'TargetMode="External"' in content:
+                    result["external_links"] = True
+                    result["indicators"].append(
+                        "PPTX external relationship detected"
+                    )
+
+                for url in re.findall(
+                    r"https?://[^\s\"'<>]+", content, flags=re.IGNORECASE
+                ):
+                    if (
+                        "schemas.openxmlformats.org" not in url.lower()
+                        and "schemas.microsoft.com" not in url.lower()
+                        and url not in result["urls"]
+                    ):
+                        result["urls"].append(url)
+
+            for name in names:
+                lower_name = name.lower()
+                if not (
+                    lower_name.startswith("ppt/slides/")
+                    or lower_name.startswith("ppt/slidemasters/")
+                    or lower_name == "ppt/presentation.xml"
+                ):
+                    continue
+
+                content = z.read(name).decode("utf-8", errors="ignore")
+                if any(
+                    marker in content.lower()
+                    for marker in (
+                        "hlinkclick",
+                        "<p:action",
+                        "<p14:action",
+                        "oleobject",
+                    )
+                ):
+                    result["actions"] = True
+                    result["indicators"].append(
+                        "PPTX action or hyperlink element detected"
+                    )
+
+            result["indicators"] = list(dict.fromkeys(result["indicators"]))
+            return result
+
+    except Exception as exc:
+        result["reason"] = f"PPTX parsing failed: {exc}"
+        return result
+
 def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     """
     Orchestrates the entire multi-tier pipeline:
@@ -1012,6 +1098,19 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             xlsx_analysis.get("indicators", [])
         )
 
+    pptx_analysis = None
+
+    if (
+        type_info["actual_type"].lower() == "pptx"
+        or type_info["mime_type"].lower()
+        == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ):
+        pptx_analysis = analyze_pptx_static(data)
+
+        indicators.extend(
+            pptx_analysis.get("indicators", [])
+        )
+
     lief_analysis = None
     interesting_imports = []
 
@@ -1031,6 +1130,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "pdf_analysis": pdf_analysis,
         "docx_analysis": docx_analysis,
         "xlsx_analysis": xlsx_analysis,
+        "pptx_analysis": pptx_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -1071,7 +1171,13 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             and xlsx_analysis.get("macro") is True
         )
 
-        if docx_macro_detected or xlsx_macro_detected:
+        pptx_macro_detected = (
+            type_info["actual_type"].lower() == "pptx"
+            and pptx_analysis
+            and pptx_analysis.get("macro") is True
+        )
+
+        if docx_macro_detected or xlsx_macro_detected or pptx_macro_detected:
             final_verdict = "SUSPICIOUS"
             status = "QUARANTINE"
         else:
@@ -1115,7 +1221,19 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
             and indicators == ["XLSX external relationship detected"]
         )
 
-        if docx_only_external_link or xlsx_only_external_link:
+        pptx_only_external_link = (
+            type_info["actual_type"].lower() == "pptx"
+            and pptx_analysis
+            and pptx_analysis.get("external_links") is True
+            and not pptx_analysis.get("macro")
+            and not pptx_analysis.get("embedded_objects")
+            and not pptx_analysis.get("actions")
+            and not yara_matches
+            and not interesting_imports
+            and indicators == ["PPTX external relationship detected"]
+        )
+
+        if docx_only_external_link or xlsx_only_external_link or pptx_only_external_link:
             final_verdict = "SAFE"
             status = "APPROVED"
         else:
@@ -1141,6 +1259,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "pdf_analysis": pdf_analysis,
         "docx_analysis": docx_analysis,
         "xlsx_analysis": xlsx_analysis,
+        "pptx_analysis": pptx_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
