@@ -984,6 +984,101 @@ def analyze_image_static(data: bytes) -> dict:
         result["reason"] = f"Image parsing failed: {exc}"
         return result
 
+def analyze_svg_static(data: bytes) -> dict:
+    """Inspect SVG XML as static data without executing or resolving resources."""
+    result = {
+        "available": False,
+        "width": None,
+        "height": None,
+        "viewbox": None,
+        "script": False,
+        "event_handlers": [],
+        "external_references": [],
+        "javascript_urls": [],
+        "embedded_data": False,
+        "indicators": [],
+    }
+    max_values = 20
+    max_value_length = 200
+
+    def add_indicator(value: str) -> None:
+        if value not in result["indicators"]:
+            result["indicators"].append(value)
+
+    def bounded_value(value: object) -> str:
+        return str(value).strip()[:max_value_length]
+
+    def add_external_reference(value: object) -> None:
+        value = bounded_value(value)
+        if value and value not in result["external_references"]:
+            if len(result["external_references"]) < max_values:
+                result["external_references"].append(value)
+                add_indicator("SVG external reference detected")
+
+    def add_javascript_url(value: object) -> None:
+        value = bounded_value(value)
+        if value and value not in result["javascript_urls"]:
+            if len(result["javascript_urls"]) < max_values:
+                result["javascript_urls"].append(value)
+                add_indicator("SVG javascript URL detected")
+
+    def local_name(name: str) -> str:
+        return name.rsplit("}", 1)[-1].lower()
+
+    def inspect_reference(value: object) -> None:
+        reference = bounded_value(value)
+        lowered = reference.lower()
+        if lowered.startswith("javascript:"):
+            add_javascript_url(reference)
+            return
+        if lowered.startswith("data:"):
+            result["embedded_data"] = True
+            add_indicator("SVG embedded data detected")
+            return
+        if (
+            lowered.startswith(("http://", "https://", "//", "ftp://", "file:"))
+            or re.match(r"^[a-z][a-z0-9+.-]*:", lowered)
+        ):
+            add_external_reference(reference)
+
+    try:
+        raw_text = data.decode("utf-8", errors="ignore")
+        if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", raw_text, re.IGNORECASE):
+            add_indicator("SVG XML entity/DOCTYPE construct detected")
+
+        root = ET.fromstring(data)
+        result["available"] = True
+
+        for attribute_name, attribute_value in root.attrib.items():
+            name = local_name(attribute_name)
+            value = bounded_value(attribute_value)
+            if name == "width":
+                result["width"] = value
+            elif name == "height":
+                result["height"] = value
+            elif name == "viewbox":
+                result["viewbox"] = value
+
+        for element in root.iter():
+            if local_name(str(element.tag)) == "script":
+                result["script"] = True
+                add_indicator("SVG script element detected")
+
+            for attribute_name, attribute_value in element.attrib.items():
+                name = local_name(attribute_name)
+                value = bounded_value(attribute_value)
+                if name.startswith("on"):
+                    if name not in result["event_handlers"] and len(result["event_handlers"]) < max_values:
+                        result["event_handlers"].append(name)
+                    add_indicator("SVG event handler detected")
+                elif name in {"href", "src", "link"}:
+                    inspect_reference(value)
+
+        return result
+    except Exception as exc:
+        result["reason"] = f"SVG parsing failed: {exc}"
+        return result
+
 def extract_interesting_imports(lief_analysis: dict) -> list[dict]:
     """
     Classify potentially interesting imported Windows APIs.
@@ -1182,6 +1277,7 @@ File details:
 - PPTX static analysis: {context.get('pptx_analysis')}
 - ZIP static analysis: {context.get('zip_analysis')}
 - IMAGE static analysis: {context.get('image_analysis')}
+- SVG static analysis: {context.get('svg_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
 DOCX interpretation guidance:
@@ -1229,6 +1325,12 @@ IMAGE static analysis guidance:
 - Never confuse image findings with PDF, DOCX, XLSX, PPTX, or ZIP findings.
 - If image_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed indicator(s).
 - Do not claim that no suspicious indicators were detected when image_analysis.indicators is non-empty.
+
+SVG static analysis guidance:
+- SVG findings are static-analysis evidence only. A script, event handler, external reference, javascript URL, embedded data, or XML entity/DOCTYPE construct does not automatically prove malware.
+- Never invent payloads, execution behavior, URLs, exploits, or malware capabilities.
+- If svg_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed indicator(s).
+- Never confuse SVG findings with PNG, JPEG, GIF, BMP, TIFF, or WEBP findings.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -1633,11 +1735,24 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         zip_analysis = analyze_zip_static(data)
         indicators.extend(zip_analysis.get("indicators", []))
 
+    svg_analysis = None
+    is_svg_file = (
+        actual_type in {"svg", "svg+xml"}
+        or mime_type == "image/svg+xml"
+    )
+
+    if is_svg_file:
+        svg_analysis = analyze_svg_static(data)
+        indicators.extend(svg_analysis.get("indicators", []))
+
     image_analysis = None
     image_types = {"jpeg", "jpg", "png", "gif", "bmp", "tiff", "webp"}
     is_image_file = (
-        actual_type in image_types
-        or mime_type.startswith("image/")
+        not is_svg_file
+        and (
+            actual_type in image_types
+            or mime_type.startswith("image/")
+        )
     )
 
     if is_image_file:
@@ -1666,6 +1781,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "pptx_analysis": pptx_analysis,
         "zip_analysis": zip_analysis,
         "image_analysis": image_analysis,
+        "svg_analysis": svg_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -1797,6 +1913,7 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "pptx_analysis": pptx_analysis,
         "zip_analysis": zip_analysis,
         "image_analysis": image_analysis,
+        "svg_analysis": svg_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
