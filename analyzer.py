@@ -5,6 +5,7 @@ import re
 import struct
 import zipfile
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 import openpyxl
 import lief
 import yara
@@ -1079,6 +1080,259 @@ def analyze_svg_static(data: bytes) -> dict:
         result["reason"] = f"SVG parsing failed: {exc}"
         return result
 
+def analyze_html_static(data: bytes) -> dict:
+    """Inspect HTML syntax and references without executing or fetching content."""
+    result = {
+        "available": False,
+        "script": False,
+        "script_count": 0,
+        "inline_scripts": [],
+        "event_handlers": [],
+        "javascript_urls": [],
+        "external_references": [],
+        "data_urls": [],
+        "embedded_elements": [],
+        "external_form_actions": [],
+        "meta_refresh": [],
+        "indicators": [],
+    }
+    max_items = 20
+    max_value_length = 240
+    max_script_length = 500
+
+    def bounded(value: object, limit: int = max_value_length) -> str:
+        return str(value).strip()[:limit]
+
+    def add_unique(field: str, value: str) -> None:
+        if value and value not in result[field] and len(result[field]) < max_items:
+            result[field].append(value)
+
+    def add_indicator(value: str) -> None:
+        if value not in result["indicators"]:
+            result["indicators"].append(value)
+
+    class StaticHTMLParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self.in_script = False
+            self.script_buffer = []
+            self.script_length = 0
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+            tag = tag.lower()
+            attributes = {
+                name.lower(): value or ""
+                for name, value in attrs
+                if name
+            }
+
+            if tag == "script":
+                result["script"] = True
+                result["script_count"] += 1
+                add_indicator("HTML script element detected")
+                self.in_script = True
+                self.script_buffer = []
+                self.script_length = 0
+
+            for name in attributes:
+                if name.startswith("on"):
+                    add_unique("event_handlers", name)
+                    add_indicator("HTML event handler detected")
+
+            for name in {"href", "src", "action", "formaction"}:
+                value = attributes.get(name)
+                if not value:
+                    continue
+                bounded_value = bounded(value)
+                lowered_value = bounded_value.lower()
+                if lowered_value.startswith("javascript:"):
+                    add_unique("javascript_urls", bounded_value)
+                    add_indicator("HTML javascript URL detected")
+                elif lowered_value.startswith("data:"):
+                    add_unique("data_urls", bounded_value)
+                    add_indicator("HTML embedded data URL detected")
+                elif lowered_value.startswith(("http://", "https://")):
+                    reference = f"{name}={bounded_value}"
+                    add_unique("external_references", reference)
+                    add_indicator("HTML external reference detected")
+                    if tag == "form" and name == "action":
+                        add_unique("external_form_actions", reference)
+                        add_indicator("HTML external form action detected")
+
+            if tag in {"iframe", "object", "embed"}:
+                details = " ".join(
+                    f"{name}={bounded(value)}"
+                    for name, value in attributes.items()
+                    if value
+                    and name in {"src", "data", "type", "name", "id"}
+                )
+                add_unique("embedded_elements", f"{tag} {details}".strip())
+                add_indicator("HTML embedded content detected")
+
+            if tag == "meta":
+                http_equiv = attributes.get("http-equiv", "").lower()
+                if http_equiv == "refresh":
+                    refresh = bounded(attributes.get("content", ""))
+                    add_unique("meta_refresh", refresh or "http-equiv=refresh")
+                    add_indicator("HTML meta refresh detected")
+
+        def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+            self.handle_starttag(tag, attrs)
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag.lower() == "script" and self.in_script:
+                snippet = bounded("".join(self.script_buffer), max_script_length)
+                if snippet:
+                    add_unique("inline_scripts", snippet)
+                self.in_script = False
+                self.script_buffer = []
+                self.script_length = 0
+
+        def handle_data(self, data: str) -> None:
+            if not self.in_script:
+                return
+            remaining = max_script_length - self.script_length
+            if remaining <= 0:
+                return
+            chunk = data[:remaining]
+            self.script_buffer.append(chunk)
+            self.script_length += len(chunk)
+
+    try:
+        parser = StaticHTMLParser()
+        parser.feed(data.decode("utf-8", errors="replace"))
+        parser.close()
+        if parser.in_script:
+            snippet = bounded("".join(parser.script_buffer), max_script_length)
+            if snippet:
+                add_unique("inline_scripts", snippet)
+        result["available"] = True
+        return result
+    except Exception as exc:
+        result["reason"] = f"HTML parsing failed: {exc}"
+        return result
+
+def analyze_javascript_static(data: bytes) -> dict:
+    """Inspect standalone JavaScript as bounded text without executing it."""
+    result = {
+        "available": False,
+        "script_features": [],
+        "dynamic_execution": [],
+        "obfuscation": [],
+        "network_apis": [],
+        "browser_apis": [],
+        "storage_apis": [],
+        "external_references": [],
+        "indicators": [],
+    }
+    max_analysis_size = 2 * 1024 * 1024
+    max_items = 20
+    max_value_length = 240
+
+    def bounded(value: object) -> str:
+        return str(value).strip()[:max_value_length]
+
+    def add_unique(field: str, value: object) -> None:
+        value = bounded(value)
+        if value and value not in result[field] and len(result[field]) < max_items:
+            result[field].append(value)
+
+    def add_indicator(value: str) -> None:
+        if value not in result["indicators"]:
+            result["indicators"].append(value)
+
+    def add_matches(field: str, pattern: str, indicator: str) -> None:
+        matches = re.finditer(pattern, source, flags=re.IGNORECASE | re.MULTILINE)
+        found = False
+        for match in matches:
+            add_unique(field, match.group(0))
+            found = True
+        if found:
+            add_indicator(indicator)
+
+    if not data:
+        result["reason"] = "JavaScript input is empty"
+        return result
+
+    try:
+        source = data[:max_analysis_size].decode("utf-8", errors="replace")
+    except (AttributeError, TypeError, UnicodeError):
+        result["reason"] = "JavaScript input could not be decoded"
+        return result
+
+    if not source:
+        result["reason"] = "JavaScript input is empty"
+        return result
+
+    dynamic_patterns = [
+        r"\beval\s*\(",
+        r"\bFunction\s*\(",
+        r"\bset(?:Timeout|Interval)\s*\(\s*(['\"])",
+        r"\bdocument\s*\.\s*write\s*\(",
+        r"\b(?:WebAssembly|WebAssembly\s*\.\s*(?:instantiate|compile|Module))\b",
+        r"\bimport\s*\(",
+        r"\bdocument\s*\.\s*createElement\s*\(\s*['\"]script['\"]",
+    ]
+    for pattern in dynamic_patterns:
+        add_matches("dynamic_execution", pattern, "JAVASCRIPT dynamic execution pattern detected")
+
+    add_matches(
+        "script_features",
+        r"\b(?:WebAssembly|WebAssembly\s*\.\s*(?:instantiate|compile|Module))\b|\bimport\s*\(",
+        "JAVASCRIPT script feature detected",
+    )
+
+    add_matches(
+        "network_apis",
+        r"\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\b|\bnavigator\s*\.\s*sendBeacon\s*\(",
+        "JAVASCRIPT network API detected",
+    )
+    add_matches(
+        "browser_apis",
+        r"\bdocument\s*\.\s*cookie\b|\bwindow\s*\.\s*open\s*\(|\bnavigator\s*\.[A-Za-z_$][\w$]*|\blocation(?:\s*\.|\s*=)",
+        "JAVASCRIPT browser-sensitive API detected",
+    )
+    add_matches(
+        "storage_apis",
+        r"\b(?:localStorage|sessionStorage)\b",
+        "JAVASCRIPT browser-sensitive API detected",
+    )
+
+    obfuscation_patterns = [
+        r"\bString\s*\.\s*fromCharCode\s*\(",
+        r"\batob\s*\(",
+        r"\bbtoa\s*\(",
+    ]
+    for pattern in obfuscation_patterns:
+        add_matches("obfuscation", pattern, "JAVASCRIPT obfuscation indicator detected")
+
+    string_literals = re.finditer(r"(['\"])(?:\\.|(?!\1).){1,}", source, re.DOTALL)
+    escape_count = len(re.findall(r"\\(?:x[0-9a-f]{2}|u[0-9a-f]{4}|.)", source, re.IGNORECASE))
+    long_encoded_found = False
+    for match in string_literals:
+        literal = match.group(0)
+        content = literal[1:-1]
+        if len(content) >= 120 and re.fullmatch(r"[A-Za-z0-9+/=_\-]+", content):
+            add_unique("obfuscation", literal)
+            long_encoded_found = True
+    if escape_count >= 20:
+        add_unique("obfuscation", f"escape sequences: {escape_count}")
+    if long_encoded_found or escape_count >= 20:
+        add_indicator("JAVASCRIPT obfuscation indicator detected")
+
+    add_matches(
+        "external_references",
+        r"(?:https?://|//)[^\s<>\"'`\\)]+",
+        "JAVASCRIPT external reference detected",
+    )
+
+    if result["dynamic_execution"]:
+        result["script_features"].extend(result["dynamic_execution"][:max_items])
+        result["script_features"] = list(dict.fromkeys(result["script_features"]))[:max_items]
+    result["available"] = True
+    return result
+
+
 def extract_interesting_imports(lief_analysis: dict) -> list[dict]:
     """
     Classify potentially interesting imported Windows APIs.
@@ -1278,6 +1532,8 @@ File details:
 - ZIP static analysis: {context.get('zip_analysis')}
 - IMAGE static analysis: {context.get('image_analysis')}
 - SVG static analysis: {context.get('svg_analysis')}
+- HTML static analysis: {context.get('html_analysis')}
+- JavaScript static analysis: {context.get('javascript_analysis')}
 - LIEF analysis: {context.get('lief_analysis')}
 
 DOCX interpretation guidance:
@@ -1331,6 +1587,21 @@ SVG static analysis guidance:
 - Never invent payloads, execution behavior, URLs, exploits, or malware capabilities.
 - If svg_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed indicator(s).
 - Never confuse SVG findings with PNG, JPEG, GIF, BMP, TIFF, or WEBP findings.
+
+HTML static analysis guidance:
+- HTML findings are static-analysis evidence only. JavaScript, event handlers, javascript URLs, external references, data URLs, iframe/object/embed elements, external form actions, and meta refresh are not automatically malicious.
+- Never invent JavaScript behavior, commands, payloads, exploits, URLs, or malware capabilities. Only mention HTML evidence explicitly present in html_analysis.
+- Never confuse HTML findings with SVG, raster-image, PDF, Office, or ZIP findings.
+- If html_analysis.indicators is non-empty, the reason MUST acknowledge the actual observed HTML indicator(s).
+- Do not claim that no suspicious indicators were detected when HTML indicators are present.
+
+JavaScript static analysis guidance:
+- JavaScript findings are static-analysis evidence only. eval(), Function(), string-based timers, WebAssembly, dynamic imports, document.write(), dynamic script creation, network APIs, browser APIs, storage APIs, obfuscation indicators, and external references do not automatically prove malware.
+- Do not invent JavaScript behavior, commands, payloads, exploits, persistence, malware families, or capabilities.
+- Only discuss evidence actually present in javascript_analysis.
+- If javascript_analysis.indicators is non-empty, the reason MUST acknowledge the actual JavaScript indicator(s).
+- Do not claim that no suspicious indicators exist when javascript_analysis contains indicators.
+- Do not confuse standalone JavaScript with HTML, SVG, raster images, Office documents, PDFs, or ZIP archives.
 
 Printable snippet:
 \"\"\"{extracted_text}\"\"\"
@@ -1712,6 +1983,14 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
 
     actual_type = type_info["actual_type"].lower()
     mime_type = type_info["mime_type"].lower()
+    is_javascript_file = (
+        actual_type in {"javascript", "js"}
+        or mime_type in {
+            "application/javascript",
+            "text/javascript",
+            "application/x-javascript",
+        }
+    )
     office_package_detected = (
         actual_type in {"docx", "xlsx", "pptx"}
         or mime_type in {
@@ -1737,18 +2016,41 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
 
     svg_analysis = None
     is_svg_file = (
-        actual_type in {"svg", "svg+xml"}
-        or mime_type == "image/svg+xml"
+        not is_javascript_file
+        and (
+            actual_type in {"svg", "svg+xml"}
+            or mime_type == "image/svg+xml"
+        )
     )
 
     if is_svg_file:
         svg_analysis = analyze_svg_static(data)
         indicators.extend(svg_analysis.get("indicators", []))
 
+    html_analysis = None
+    is_html_file = (
+        not is_javascript_file
+        and
+        not is_svg_file
+        and not office_package_detected
+        and not is_zip_archive
+        and (
+            actual_type == "html"
+            or mime_type == "text/html"
+        )
+    )
+
+    if is_html_file:
+        html_analysis = analyze_html_static(data)
+        indicators.extend(html_analysis.get("indicators", []))
+
     image_analysis = None
     image_types = {"jpeg", "jpg", "png", "gif", "bmp", "tiff", "webp"}
     is_image_file = (
+        not is_javascript_file
+        and
         not is_svg_file
+        and not is_html_file
         and (
             actual_type in image_types
             or mime_type.startswith("image/")
@@ -1758,6 +2060,11 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
     if is_image_file:
         image_analysis = analyze_image_static(data)
         indicators.extend(image_analysis.get("indicators", []))
+
+    javascript_analysis = None
+    if is_javascript_file:
+        javascript_analysis = analyze_javascript_static(data)
+        indicators.extend(javascript_analysis.get("indicators", []))
 
     lief_analysis = None
     interesting_imports = []
@@ -1782,6 +2089,8 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "zip_analysis": zip_analysis,
         "image_analysis": image_analysis,
         "svg_analysis": svg_analysis,
+        "html_analysis": html_analysis,
+        "javascript_analysis": javascript_analysis,
         "lief_analysis": lief_analysis,
     }
 
@@ -1914,6 +2223,8 @@ def run_full_triage(data: bytes, filename: str) -> Dict[str, Any]:
         "zip_analysis": zip_analysis,
         "image_analysis": image_analysis,
         "svg_analysis": svg_analysis,
+        "html_analysis": html_analysis,
+        "javascript_analysis": javascript_analysis,
         "lief_analysis": lief_analysis,
         "clamav_status": "CLEAN" if not clam_threat else clam_threat,
         "ai_triage": llm_result
